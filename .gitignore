@@ -1,0 +1,10 @@
+__pycache__/
+
+
+/static/OPENAI_API_KEY
+/static/QWEN_API_KEY
+.env
+
+*.zip
+*.tar
+*.tar.gz

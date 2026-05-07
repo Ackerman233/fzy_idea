@@ -1,0 +1,30 @@
+# promptfooconfig.yaml
+
+# 1. 定义你想对比的多个 Prompt
+prompts:
+  - "你是助手，用户问天气时请调用工具：{{query}}"
+  - "你是一个专业的调度员。如果用户询问特定地点的天气，请务必提取城市名并使用天气工具：{{query}}"
+
+# 2. 配置模型和它能使用的工具 (Tools)
+providers:
+  - id: openai:gpt-4o
+    config:
+      tools:
+        - type: function
+          function:
+            name: get_weather
+            parameters:
+              type: object
+              properties:
+                location: { type: string }
+                unit: { type: string, enum: [c, f] }
+
+# 3. 定义测试用例和打分逻辑
+tests:
+  - vars:
+      query: "伦敦今天冷吗？"
+    assert:
+      - type: is-valid-openai-function-call  # 检查是否生成了合法的调用
+      - type: javascript
+        # 编写一段简单的 JS 来打分：必须调用了 get_weather 且参数包含 'London'
+        value: output.function_call.name === 'get_weather' && output.function_call.arguments.includes('London')
