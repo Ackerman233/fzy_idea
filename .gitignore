@@ -1,5 +1,5 @@
 __pycache__/
-
+datasets/
 
 /static/OPENAI_API_KEY
 /static/QWEN_API_KEY
