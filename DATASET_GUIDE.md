@@ -1,23 +1,27 @@
-# Test-Time-Tool-Evol 数据集接入 fzy_idea 使用指南
+# fzy_idea 数据集评估使用指南
 
 ## 概述
 
-本文档记录如何将 `Test-Time-Tool-Evol` 项目的数据集接入 `fzy_idea/eval_demo` 进行评估。
+本文档记录如何将外部数据集接入 `fzy_idea/eval_dataset.py` 进行批量评估。目前支持两个数据源：
+
+- **Test-Time-Tool-Evol (TTE)** — 科学计算题，共享工具集
+- **ToolHop** — 多跳问答 benchmark，每题独立工具集
 
 ## 文件结构
 
 ```
 fzy_idea/
 ├── eval_demo.py                  # 原有评估脚本（未修改）
-├── eval_dataset.py               # 新建：批量数据集评估脚本
-├── tool_helpers.py               # 新建：从 Test-Time-Tool-Evol 提取的工具函数集合
+├── eval_dataset.py               # 批量数据集评估脚本（支持 TTE + ToolHop）
+├── tool_helpers.py               # 从 TTE 提取的工具函数集合
 ├── scripts/
-│   └── convert_tte_dataset.py    # 新建：TTE 原始 JSON → eval_dataset 格式转换脚本
+│   ├── convert_tte_dataset.py    # TTE 原始 JSON → eval_dataset 格式转换
+│   └── convert_toolhop.py        # ToolHop → eval_dataset 格式转换
 ├── datasets/
-│   ├── scibench_sample.json      # 新建：scibench 科学计算题示例 (5题)
-│   ├── scieval_sample.json       # 新建：scieval 科学选择题示例 (5题)
-│   ├── scievo_sample.json        # 新建：scievo 进化数据集示例 (5题)
-│   └── eval_demo_sample.json     # 新建：eval_demo 原有示例 (1题)
+│   ├── scibench_sample.json      # scibench 科学计算题示例 (5题)
+│   ├── scieval_sample.json       # scieval 科学选择题示例 (5题)
+│   ├── scievo_sample.json        # scievo 进化数据集示例 (5题)
+│   └── eval_demo_sample.json     # eval_demo 原有示例 (1题)
 └── DATASET_GUIDE.md              # 本文件
 ```
 
@@ -72,6 +76,8 @@ fzy_idea/
 | `test_cases[].question` | 是 | 用户问题 |
 | `test_cases[].expected_answer` | 是 | 标准答案 |
 | `test_cases[].answer_keywords` | 否 | 关键词列表，用于模糊匹配打分 |
+| `test_cases[].answer_type` | 否 | 答案类型（ToolHop 模式：`number`/`date`/`string`/`letter`） |
+| `test_cases[].tools` | 否 | 每题独立工具列表（per-sample tools，格式同顶层 `tools`） |
 | `test_cases[].source` | 否 | 来源数据集路径 |
 | `test_cases[].category` | 否 | 题目类别 |
 
@@ -127,6 +133,41 @@ Predict the pressure exerted by the ethane from the perfect gas.
 
 来源：`fzy_idea/eval_demo.py` 原有的天气+计算示例，用于对比验证。
 
+### 5. ToolHop — 多跳工具调用 Benchmark
+
+来源：`src/ToolHop/dataset/ToolHop.json`（995 道题）
+
+ToolHop 是一个多跳问答 benchmark，测试 LLM 能否正确链式调用 3-7 个工具来回答复杂问题。每道题有**自己独立的工具集**（mock Python 函数），不同于 TTE 的共享工具模式。
+
+**数据结构特点**：
+- 每道题包含 `question`（多跳问题）、`answer`（标准答案）、`tools`（该题专用工具）、`functions`（工具的 Python 代码）
+- 每个工具是一个完整的 Python 函数，包含硬编码的模拟逻辑，返回确定性结果
+- 题目覆盖 62 个领域（Film、History、Mathematics、Genealogy 等）
+- 答案类型：number (602)、date (165)、string (164)、letter (41) 等
+
+**评估场景**（来自原始 benchmark）：
+
+| 场景 | 说明 |
+|------|------|
+| `direct` | 不提供工具，模型直接回答（测试知识能力） |
+| `mandatory` | 提供工具，系统提示要求必须调用工具（测试强制工具使用） |
+| `free` | 提供工具，不限制是否使用（测试自愿工具使用） |
+
+**打分方式**（精确匹配，与 TTE 的关键词匹配不同）：
+1. 提取 `<answer>...</answer>` 标签中的内容
+2. 先 `eval()` 数值比较，失败则大小写不敏感字符串匹配
+3. 额外奖励：如果工具输出中包含标准答案，也算正确
+
+示例题目：
+```
+How many letters (exclude the first and last) are there in the first name
+of the person who designed Salisbury Woodland Gardens?
+
+工具链: geo_relationship_finder → historical_figure_identifier
+        → extract_first_name → count_letters
+期望答案: 4
+```
+
 ## 使用方法
 
 ### 前置条件
@@ -158,6 +199,10 @@ python3 eval_dataset.py --dataset datasets/scievo_sample.json
 # 评估 eval_demo 原有示例
 python3 eval_dataset.py --dataset datasets/eval_demo_sample.json
 
+# 评估 ToolHop（先转换，再评估）
+python3 scripts/convert_toolhop.py -n 20 --scenario free
+python3 eval_dataset.py --dataset datasets/toolhop_free_20.json
+
 # 指定模型
 python3 eval_dataset.py --dataset datasets/scibench_sample.json --model gpt-4o
 
@@ -185,7 +230,11 @@ python3 eval_dataset.py --dataset datasets/scibench_sample.json --limit 2
 
 ## 打分机制
 
-评估脚本使用三维度打分，满分 100：
+评估脚本支持两种打分模式，根据数据集自动选择：
+
+### TTE 模式（关键词匹配，满分 100）
+
+当数据集没有 `answer_type` 字段时使用：
 
 | 维度 | 分值 | 说明 |
 |------|------|------|
@@ -195,7 +244,20 @@ python3 eval_dataset.py --dataset datasets/scibench_sample.json --limit 2
 
 选择题（单字母答案）会自动跳过工具调用评分，给满分 30。
 
-## 从 Test-Time-Tool-Evol 批量转换
+### ToolHop 模式（精确匹配，0 或 100）
+
+当数据集有 `answer_type` 字段时使用：
+
+1. 提取 `<answer>...</answer>` 标签中的内容
+2. 先尝试 `eval()` 数值比较（如 `4 == 4`）
+3. 失败则大小写不敏感字符串比较（去掉 `.0` 后缀和逗号）
+4. 额外奖励：如果最后一条工具响应中包含标准答案，也算正确
+
+最终输出准确率 = 正确数 / 总题数 × 100%。
+
+## 数据集转换脚本
+
+### 从 Test-Time-Tool-Evol 转换
 
 使用 `scripts/convert_tte_dataset.py` 可以直接从原始 TTE JSON 文件转换为 eval_dataset 格式。
 
@@ -246,6 +308,33 @@ python3 scripts/convert_tte_dataset.py /data/scieval/scieval_bio.json --no-tools
 python3 scripts/convert_tte_dataset.py /data/scievo/ --name scievo_full \
   --system-prompt "你是一个科学计算助手，请调用工具并给出精确答案。"
 ```
+
+### 从 ToolHop 转换
+
+使用 `scripts/convert_toolhop.py` 将 ToolHop benchmark 转换为 eval_dataset 格式。
+
+```bash
+cd /opt/data/private/src/fzy_idea
+
+# 转换前 20 题，free 模式
+python3 scripts/convert_toolhop.py -n 20 --scenario free
+
+# 转换全部 995 题，mandatory 模式
+python3 scripts/convert_toolhop.py --scenario mandatory -o datasets/toolhop_mandatory_full.json
+
+# 转换 direct 模式（不提供工具，测试纯知识能力）
+python3 scripts/convert_toolhop.py -n 50 --scenario direct
+```
+
+| 参数 | 说明 |
+|------|------|
+| `-i, --input` | ToolHop.json 路径（默认 `src/ToolHop/dataset/ToolHop.json`） |
+| `-o, --output` | 输出路径（默认 `datasets/toolhop_<scenario>_<n>.json`） |
+| `-n, --limit` | 只转换前 N 道题 |
+| `--scenario` | 评估场景：`direct` / `mandatory` / `free`（默认 `free`） |
+| `--name` | 数据集名称 |
+
+转换后的 JSON 中，每道题的 `tools` 字段包含该题专用的工具列表（3-7 个），`eval_dataset.py` 会自动检测并使用 per-sample tools 模式。
 
 ## 工具函数来源
 

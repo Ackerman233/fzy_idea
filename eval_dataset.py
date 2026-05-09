@@ -47,6 +47,8 @@ class TestCase:
     answer_keywords: list[str]
     source: str = ""
     category: str = ""
+    answer_type: str = ""  # ToolHop: number/date/string/letter/datetime/character
+    per_case_tools: list[dict[str, Any]] = field(default_factory=list)  # 每题独立工具
 
 
 @dataclass
@@ -123,7 +125,11 @@ def load_dataset(file_path: str) -> DatasetInfo:
     tools_schema, tool_dispatch = build_tools_from_json(data.get("tools", []))
 
     test_cases = []
+    has_per_case_tools = False
     for tc in data.get("test_cases", []):
+        per_case = tc.get("tools", [])
+        if per_case:
+            has_per_case_tools = True
         test_cases.append(TestCase(
             id=tc["id"],
             question=tc["question"],
@@ -131,7 +137,12 @@ def load_dataset(file_path: str) -> DatasetInfo:
             answer_keywords=tc.get("answer_keywords", []),
             source=tc.get("source", ""),
             category=tc.get("category", ""),
+            answer_type=tc.get("answer_type", ""),
+            per_case_tools=per_case,
         ))
+
+    if has_per_case_tools:
+        Console().print("[cyan]检测到 per-sample tools 模式（如 ToolHop）[/cyan]")
 
     return DatasetInfo(
         name=data.get("name", "unknown"),
@@ -188,8 +199,14 @@ def run_llm_with_tools(
 
             # 执行本地工具
             if func_name in tool_dispatch:
-                arg_value = next(iter(args.values()), "") if args else ""
-                result = tool_dispatch[func_name](arg_value)
+                try:
+                    raw_result = tool_dispatch[func_name](**args) if args else tool_dispatch[func_name]()
+                except TypeError:
+                    # 回退：单参数模式（兼容旧工具）
+                    arg_value = next(iter(args.values()), "") if args else ""
+                    raw_result = tool_dispatch[func_name](arg_value)
+                # 确保结果是字符串
+                result = raw_result if isinstance(raw_result, str) else json.dumps(raw_result, ensure_ascii=False, default=str)
             else:
                 result = json.dumps({"error": f"未知工具: {func_name}"}, ensure_ascii=False)
 
@@ -326,6 +343,61 @@ def calculate_reward(
     return {"total": total, "breakdown": breakdown}
 
 
+def toolhop_exact_match(
+    ground_truth: str,
+    solution_str: str,
+    tool_chain: list[TrajectoryStep],
+) -> dict[str, Any]:
+    """
+    ToolHop 精确匹配打分（来自 evaluation_closed.py）。
+    返回 {"correct": 0|1, "detail": str}
+    """
+    correct = 0
+    detail = ""
+
+    # 提取 <answer>...</answer> 标签
+    extracted = solution_str
+    if "<answer>" in solution_str:
+        extracted = solution_str.split("<answer>")[-1]
+        if "</answer>" in extracted:
+            extracted = extracted.split("</answer>")[0]
+
+    # 尝试 eval() 比较
+    try:
+        gt_val = eval(ground_truth.strip())  # noqa: S307
+    except Exception:
+        # eval 失败，用字符串匹配
+        gt_clean = str(ground_truth).removesuffix(".0").lower()
+        sol_clean = str(extracted).removesuffix(".0").replace(",", "").lower()
+        if gt_clean in sol_clean:
+            correct = 1
+            detail = f"字符串匹配: '{gt_clean}' in '{sol_clean[:50]}'"
+        else:
+            detail = f"不匹配: 期望 '{gt_clean}', 实际 '{sol_clean[:50]}'"
+    else:
+        try:
+            sol_val = eval(extracted.strip())  # noqa: S307
+        except Exception:
+            detail = f"eval 失败: '{extracted[:50]}'"
+        else:
+            if gt_val == sol_val:
+                correct = 1
+                detail = f"精确匹配: {gt_val} == {sol_val}"
+            else:
+                detail = f"不匹配: {gt_val} != {sol_val}"
+
+    # 额外奖励：工具输出中包含答案
+    if correct == 0 and tool_chain:
+        last_tool_result = tool_chain[-1].result
+        gt_clean = str(ground_truth).removesuffix(".0").lower()
+        result_clean = last_tool_result.removesuffix(".0").replace(",", "").lower()
+        if gt_clean in result_clean:
+            correct = 1
+            detail = f"工具输出包含答案: '{gt_clean}' in tool result"
+
+    return {"correct": correct, "detail": detail}
+
+
 # ============================================================================
 # 6. 报告输出
 # ============================================================================
@@ -337,6 +409,8 @@ def print_report(
     """使用 rich 打印评估报告"""
     console = Console()
 
+    is_toolhop = any(tc.answer_type for tc, _, _ in results)
+
     # 主表格
     table = Table(
         title=f"数据集评估报告: {dataset_name}",
@@ -344,15 +418,19 @@ def print_report(
         expand=True,
     )
     table.add_column("ID", style="cyan", width=20)
-    table.add_column("类别", width=8)
+    table.add_column("类别", width=10)
     table.add_column("工具调用", justify="center", width=8)
-    table.add_column("关键词匹配\n(满分60)", justify="center", width=10)
-    table.add_column("工具合理性\n(满分30)", justify="center", width=10)
-    table.add_column("冗余惩罚", justify="center", width=8)
-    table.add_column("总分", justify="center", style="bold", width=8)
+
+    if is_toolhop:
+        table.add_column("结果", justify="center", width=6)
+        table.add_column("匹配详情", width=50)
+    else:
+        table.add_column("关键词匹配\n(满分60)", justify="center", width=10)
+        table.add_column("工具合理性\n(满分30)", justify="center", width=10)
+        table.add_column("冗余惩罚", justify="center", width=8)
     table.add_column("最终回答 (截断)", width=40)
 
-    total_scores = []
+    correct_count = 0
 
     for tc, llm_result, reward in results:
         bd = reward["breakdown"]
@@ -360,31 +438,53 @@ def print_report(
         if len(llm_result.final_answer or "") > 80:
             answer_display += "..."
 
-        total_score = reward["total"]
-        total_scores.append(total_score)
-        score_style = "green" if total_score >= 80 else "yellow" if total_score >= 50 else "red"
-
-        table.add_row(
-            tc.id,
-            tc.category,
-            str(len(llm_result.tool_chain)),
-            f"{bd['关键词匹配']['score']}/{bd['关键词匹配']['max']}",
-            f"{bd['工具调用合理性']['score']}/{bd['工具调用合理性']['max']}",
-            str(bd["冗余惩罚"]["score"]),
-            f"[{score_style}]{total_score}[/{score_style}]",
-            answer_display,
-        )
+        if is_toolhop:
+            is_correct = reward.get("toolhop_correct", 0)
+            correct_count += is_correct
+            result_style = "green" if is_correct else "red"
+            result_label = f"[{result_style}]{'✓' if is_correct else '✗'}[/{result_style}]"
+            detail = bd.get("精确匹配", {}).get("detail", "")
+            table.add_row(
+                tc.id,
+                tc.category,
+                str(len(llm_result.tool_chain)),
+                result_label,
+                detail,
+                answer_display,
+            )
+        else:
+            total_score = reward["total"]
+            score_style = "green" if total_score >= 80 else "yellow" if total_score >= 50 else "red"
+            table.add_row(
+                tc.id,
+                tc.category,
+                str(len(llm_result.tool_chain)),
+                f"{bd['关键词匹配']['score']}/{bd['关键词匹配']['max']}",
+                f"{bd['工具调用合理性']['score']}/{bd['工具调用合理性']['max']}",
+                str(bd["冗余惩罚"]["score"]),
+                f"[{score_style}]{total_score}[/{score_style}]",
+                answer_display,
+            )
 
     console.print(table)
 
     # 汇总统计
-    if total_scores:
-        avg_score = sum(total_scores) / len(total_scores)
-        pass_count = sum(1 for s in total_scores if s >= 60)
-        console.print(f"\n[bold]汇总:[/bold]")
-        console.print(f"  总题数: {len(total_scores)}")
-        console.print(f"  平均分: {avg_score:.1f}/100")
-        console.print(f"  及格率 (>=60分): {pass_count}/{len(total_scores)} ({100*pass_count/len(total_scores):.0f}%)")
+    if is_toolhop:
+        total_count = len(results)
+        accuracy = 100 * correct_count / total_count if total_count else 0
+        console.print(f"\n[bold]汇总 (ToolHop 模式):[/bold]")
+        console.print(f"  总题数: {total_count}")
+        console.print(f"  正确数: {correct_count}")
+        console.print(f"  准确率: {accuracy:.1f}%")
+    else:
+        total_scores = [r["total"] for _, _, r in results]
+        if total_scores:
+            avg_score = sum(total_scores) / len(total_scores)
+            pass_count = sum(1 for s in total_scores if s >= 60)
+            console.print(f"\n[bold]汇总:[/bold]")
+            console.print(f"  总题数: {len(total_scores)}")
+            console.print(f"  平均分: {avg_score:.1f}/100")
+            console.print(f"  及格率 (>=60分): {pass_count}/{len(total_scores)} ({100*pass_count/len(total_scores):.0f}%)")
 
     # 详细得分
     console.print("\n" + "=" * 80)
@@ -400,7 +500,11 @@ def print_report(
         bd = reward["breakdown"]
         for item_name, item_data in bd.items():
             console.print(f"  {item_name}: {item_data['score']}/{item_data['max']} — {item_data['detail']}")
-        console.print(f"  [bold]总分: {reward['total']}/100[/bold]")
+        if is_toolhop:
+            status = "✓ 正确" if reward.get("toolhop_correct") else "✗ 错误"
+            console.print(f"  [bold]结果: {status}[/bold]")
+        else:
+            console.print(f"  [bold]总分: {reward['total']}/100[/bold]")
 
         if llm_result.tool_chain:
             console.print("  工具调用链:")
@@ -480,30 +584,58 @@ def main() -> None:
 
     # 逐题评估
     results: list[tuple[TestCase, LLMResult, dict[str, Any]]] = []
+    use_toolhop_mode = any(tc.answer_type for tc in dataset.test_cases)
 
     for i, tc in enumerate(dataset.test_cases, 1):
         console.print(f"[yellow][{i}/{len(dataset.test_cases)}] 正在测试: {tc.id}...[/yellow]")
+
+        # 确定本题使用的工具（per-case 优先，否则用全局）
+        if tc.per_case_tools:
+            tc_schema, tc_dispatch = build_tools_from_json(tc.per_case_tools)
+        else:
+            tc_schema = dataset.tools_schema
+            tc_dispatch = dataset.tool_dispatch
 
         llm_result = run_llm_with_tools(
             client=client,
             system_prompt=dataset.system_prompt,
             user_query=tc.question,
-            tools_schema=dataset.tools_schema,
-            tool_dispatch=dataset.tool_dispatch,
+            tools_schema=tc_schema,
+            tool_dispatch=tc_dispatch,
             model=model_name,
             max_rounds=args.max_rounds,
         )
         llm_result.test_case_id = tc.id
 
-        reward = calculate_reward(
-            tool_chain=llm_result.tool_chain,
-            final_answer=llm_result.final_answer,
-            answer_keywords=tc.answer_keywords,
-            tool_dispatch=dataset.tool_dispatch,
-        )
+        # 打分：ToolHop 模式用精确匹配，否则用关键词匹配
+        if use_toolhop_mode and tc.answer_type:
+            match_result = toolhop_exact_match(
+                ground_truth=tc.expected_answer,
+                solution_str=llm_result.final_answer,
+                tool_chain=llm_result.tool_chain,
+            )
+            reward = {
+                "total": 100 if match_result["correct"] else 0,
+                "breakdown": {
+                    "精确匹配": {
+                        "score": 100 if match_result["correct"] else 0,
+                        "max": 100,
+                        "detail": match_result["detail"],
+                    },
+                },
+                "toolhop_correct": match_result["correct"],
+            }
+        else:
+            reward = calculate_reward(
+                tool_chain=llm_result.tool_chain,
+                final_answer=llm_result.final_answer,
+                answer_keywords=tc.answer_keywords,
+                tool_dispatch=tc_dispatch,
+            )
 
         results.append((tc, llm_result, reward))
-        console.print(f"  → 完成，总分: {reward['total']}/100\n")
+        score_label = f"{'✓' if reward.get('toolhop_correct') else '✗'}" if use_toolhop_mode else f"{reward['total']}/100"
+        console.print(f"  → 完成，{score_label}\n")
 
     # 打印报告
     print_report(dataset.name, results)
